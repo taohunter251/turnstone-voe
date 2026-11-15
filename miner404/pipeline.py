@@ -81,6 +81,7 @@ METAL_SELECT_ID = 9970  # the judged metal pass after the tilt; the mirrored cal
 METAL_JUDGE_MARGIN = 0.125  # mean penalty points a metal variant must gain over the module as finished
 _HALF_METAL = re.compile(r"metalness\s*[:=]\s*0?\.(2[5-9]\d*|[34]\d*)\b")
 TILT_CHOICES = (22, 10)  # in the order they are asked while calls last  # degrees toward the cameras, offered for the finished module
+TILT_CHOICES_01 = (22, 30, 35)  # the pose-selector chooser: these tilts scored together in one call, both orders
 TILT_MARGIN = 0.25
 TILT_JUDGE_MARGIN = 0.125  # the judge-format chooser switches only above this mean penalty lead  # mean penalty points a new tilt must gain over the module as finished
 JUDGE_VIEW_NAMES = ("slightly left of the front", "slightly right of the front", "the front, from slightly below", "the front, from slightly above")
@@ -1329,7 +1330,7 @@ class Pipeline:
         self.push_in_choice = plan.forward
         self.stretch = plan.stretch
         self.depth, self.ceiling = plan.depth, plan.fill
-        self.end_reserve = 2 * worst_case(SOL, 3000, 9, JUDGE_MAX_OUTPUT) if plan.judged_tilt else 0.0
+        self.end_reserve = 2 * worst_case(SOL, 4000, 11, SELECT_MAX_OUTPUT) if plan.judged_tilt else 0.0
         self.tilt_keep_calls = 0  # no reservation for the tilt chooser: every step runs first
         self.tilt_keep_credits = self.tilt_keep_calls * worst_case(SOL, 3000, 9, JUDGE_MAX_OUTPUT)
         closeup = object_closeup(self.image)
@@ -1411,15 +1412,13 @@ class Pipeline:
         return turned
 
     def judged_tilt(self, pool: ThreadPoolExecutor, source: str) -> str:
-        """The finished module at the tilt the judge's own question prefers: the module as finished against each copy turned
-        to TILT_CHOICES degrees toward the cameras, all four front views of both as the judge sees them in one call, asked in
-        both orders. The copy with the largest mean penalty margin over the finished module is taken when that margin is
-        above zero; with any reply missing, or no room in the budget for every call, the module stays as finished."""
+        """The finished module at the tilt the pose selector prefers: the module as finished, and turned 22, 30 and 35
+        degrees toward the cameras, scored together in both orders. A new tilt must lead by TILT_MARGIN."""
         lines = _TILT_LINES.findall(source)
         if len(lines) != 1:
             return source
         variants = {"finished": source}
-        for angle in TILT_CHOICES:
+        for angle in TILT_CHOICES_01:
             variants[f"tilt{angle}"] = source.replace(lines[0], f"root.rotation.x = {angle} * Math.PI / 180;", 1)
         if self.push_in_choice:  # the judge sees the pushed module, so the candidates are chosen pushed
             variants = {name: self.pushed_forward(text) for name, text in variants.items()}
@@ -1438,52 +1437,14 @@ class Pipeline:
             candidates.append(outcome)
         if len(candidates) < 2 or candidates[0].name != "finished":
             return source
-        try:  # the judge's own four views, uncropped (candidate.front holds the zoomed sheet)
-            shots = {c.name: judge_shots(self.renderer.render(c.source, FRONT_JUDGE)) for c in candidates}
-        except RenderRejected:
+        judgements = self.scores(pool, candidates, TILT_SELECT_ID, prompts.SELECT_POSE)
+        current = judgements.get("finished")
+        if current is None:
             return source
-        image = lambda b: {"type": "input_image", "image_url": data_url(to_jpeg(b)), "detail": "high"}  # nine images: JPEG keeps the call under 8 MiB
-
-        def content(first: list[bytes], second: list[bytes]) -> list[dict[str, Any]]:
-            parts = [{"type": "input_text", "text": "Reference image (target object):"}, self.target]
-            for label, views in (("3D model 1", first), ("3D model 2", second)):
-                for i, shot in enumerate(views):
-                    parts += [{"type": "input_text", "text": f"{label}, view {i + 1} ({JUDGE_VIEW_NAMES[i]}):"}, image(shot)]
-            return parts + [{"type": "input_text", "text": JUDGE_VIEWS_USER}]
-
-        offered = candidates[1:]
-        calls = []
-        for k, candidate in enumerate(offered):
-            calls.append(Call(TILT_SELECT_ID + 2 * k, SOL, prompts.JUDGE_SYSTEM, content(shots["finished"], shots[candidate.name]), SELECT_EFFORT, JUDGE_MAX_OUTPUT))
-            calls.append(Call(TILT_SELECT_ID + 2 * k + 1, SOL, prompts.JUDGE_SYSTEM, content(shots[candidate.name], shots["finished"]), SELECT_EFFORT, JUDGE_MAX_OUTPUT))
-        estimates = [worst_case(c.model, len(c.instructions) + sum(len(p.get("text", "")) for p in c.content),
-                                sum(1 for p in c.content if p["type"] == "input_image"), c.max_output_tokens) for c in calls]
-        pairs = 0  # only as many candidates as the calls and credits left after the chain allow, in TILT_CHOICES order
-        while pairs < len(offered) and self.budget.allows(estimates[:2 * (pairs + 1)]):
-            pairs += 1
-        if not pairs:
-            return source
-        offered, calls = offered[:pairs], calls[:2 * pairs]
-        replies = self.run_stage(pool, calls)
-
-        def penalties(reply: Response | None) -> list[tuple[float, float]] | None:
-            try:
-                answer = json.loads(re.search(r"\{.*\}", reply.output_text, re.S).group(0))
-                views = sorted(answer["views"], key=lambda v: int(v["view"]))
-                pairs = [(float(v["penalty_1"]), float(v["penalty_2"])) for v in views]
-            except (ValueError, TypeError, KeyError, AttributeError):
-                return None
-            return pairs if len(pairs) == 4 else None
-
-        best, best_margin = None, TILT_JUDGE_MARGIN
-        for k, candidate in enumerate(offered):
-            ab, ba = penalties(replies[2 * k]), penalties(replies[2 * k + 1])
-            if ab is None or ba is None:
-                return source
-            margin = sum((x[0] - x[1]) + (y[1] - y[0]) for x, y in zip(ab, ba)) / 8
-            if margin > best_margin:
-                best, best_margin = candidate, margin
-        return best.source if best is not None else source
+        best = min((c for c in candidates if c.name in judgements), key=lambda c: (judgements[c.name].score, c.name != "finished"))
+        if best.name != "finished" and judgements[best.name].score + TILT_MARGIN <= current.score:
+            return best.source
+        return source
 
     def judged_metal(self, pool: ThreadPoolExecutor, source: str) -> str:
         """Where the metal pass fired: the module as finished against the same module without the pass and with the pass
